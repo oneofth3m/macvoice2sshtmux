@@ -1,0 +1,29 @@
+ssh:
+  host_alias: "myvm"
+  control_path: "~/.ssh/cm-%r@%h:%p"
+  control_persist: "60s"
+
+stream:
+  debounce_ms: 200
+  retry_window_s: 15
+  first_text_slo_ms: 700
+  update_slo_ms: 300
+
+asr:
+  backend: "faster_whisper"
+  model: "small.en"
+  language: "en"
+
+commands:
+  new_line:
+    - "new line"
+  new_paragraph:
+    - "new paragraph"
+  scratch_that:
+    - "scratch that"
+  cancel:
+    - "cancel"
+
+targeting:
+  lock_pane_at_capture_start: true
+  require_confirm_on_pane_mismatch: true

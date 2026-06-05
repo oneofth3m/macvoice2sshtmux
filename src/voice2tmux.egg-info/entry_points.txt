@@ -1,0 +1,2 @@
+[console_scripts]
+voice2tmux = voice2tmux.main:app

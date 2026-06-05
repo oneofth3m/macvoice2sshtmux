@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice2tmux"
+version = "0.1.0"
+description = "Hotkey-driven near real-time voice streaming into remote tmux panes over SSH."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "sounddevice>=0.4",
+  "typer>=0.12",
+  "webrtcvad-wheels>=2.0.14",
+]
+
+[project.optional-dependencies]
+asr = [
+  "faster-whisper>=1.0.3",
+]
+dev = [
+  "pytest>=8.2",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+voice2tmux = "voice2tmux.main:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
