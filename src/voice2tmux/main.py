@@ -127,10 +127,9 @@ def run(
     once: bool = typer.Option(False, help="Process one line and exit."),
 ) -> None:
     """
-    Starts the MVP controller and reads transcript chunks from stdin.
+    Starts controller loop and reads transcript chunks from stdin.
 
-    This lets you validate parser + rewrite-tail + tmux write behavior before
-    wiring full microphone capture and live ASR.
+    Useful for deterministic validation of parser/rewriter/tmux behavior.
     """
     ssh = SSHMux(SSHConfig(host_alias=ssh_host))
     ssh.ensure_master()
@@ -186,7 +185,7 @@ def serve(
         help="ASR window size in seconds. Lower values reduce latency.",
     ),
     asr_model: str = typer.Option(
-        "base.en",
+        "small.en",
         help="faster-whisper model size (e.g., tiny.en, base.en, small.en).",
     ),
     asr_beam_size: int = typer.Option(
@@ -197,13 +196,20 @@ def serve(
         4,
         help="Whisper best-of candidates. Lower is faster.",
     ),
+    stream_flush_ms: int = typer.Option(
+        250,
+        help="Coalesce mic transcripts and flush to tmux at this interval (ms).",
+    ),
+    stream_pause_flush_ms: int = typer.Option(
+        320,
+        help="Force flush buffered mic transcript after this much silence (ms).",
+    ),
 ) -> None:
     """
     Runs long-lived service loop.
 
     Control events are received from local hotkey clients over UNIX socket.
-    Transcript chunks are read from stdin in this MVP, so you can pipe ASR
-    output into the process while still controlling lifecycle via hotkeys.
+    Transcript source is configurable (mic by default, stdin for debug mode).
     """
     ssh = SSHMux(SSHConfig(host_alias=ssh_host))
     ssh.ensure_master()
@@ -215,6 +221,7 @@ def serve(
         target_resolver=resolver,
         writer=TmuxWriter(ssh),
     )
+    selected_interactively = tmux_target is None
     resolved_target = tmux_target or _interactive_select_tmux_target(resolver)
     controller.target_spec = resolved_target
     ipc = IPCServer(socket_path=socket_path)
@@ -243,6 +250,9 @@ def serve(
     typer.echo(f"voice2tmux service listening on {socket_path}")
     typer.echo("Send control events with: voice2tmux event --event start|stop|confirm|cancel")
     typer.echo(f"Target locked for this run: {resolved_target}")
+    if selected_interactively:
+        typer.echo("REUSE TARGET (copy/paste):")
+        typer.echo(f"$ make serve SSH_HOST={ssh_host} TMUX_TARGET={resolved_target}")
     typer.echo("Service starts in idle state. Send 'start' event to begin streaming.")
     typer.echo(f"Input source: {input_source.value}")
     if input_source == InputSource.MIC:
@@ -252,11 +262,21 @@ def serve(
             f"model={asr_model} mic_chunk_ms={mic_chunk_ms} asr_window_s={asr_window_s} "
             f"beam={asr_beam_size} best_of={asr_best_of} context=false"
         )
+        typer.echo(
+            f"Stream coalescing: flush every ~{stream_flush_ms}ms, "
+            f"pause flush ~{stream_pause_flush_ms}ms"
+        )
     else:
         typer.echo("When streaming, stdin transcript lines are forwarded to remote tmux.")
     if local_keys:
         typer.echo("Local keys: s=start/stop  c=confirm  x=cancel  q=quit  h=help")
     try:
+        pending_parts: list[str] = []
+        pending_queued_at: Optional[float] = None
+        last_chunk_arrival_at: Optional[float] = None
+        flush_interval_s = max(0.0, stream_flush_ms / 1000.0)
+        pause_flush_s = max(0.0, stream_pause_flush_ms / 1000.0)
+
         with _SingleKeyReader(enabled=local_keys) as key_reader:
             while True:
                 key = key_reader.poll_key()
@@ -267,6 +287,17 @@ def serve(
                     if mic_runtime and controller.state in {StreamState.IDLE, StreamState.STOPPED}:
                         mic_runtime.stop()
                     if should_quit:
+                        if pending_parts and pending_queued_at is not None:
+                            merged = " ".join(pending_parts).strip()
+                            if merged:
+                                queue_delay_ms = int((time.time() - pending_queued_at) * 1000)
+                                loop_started = time.time()
+                                controller.on_transcript_chunk(merged)
+                                end_to_end_ms = int((time.time() - loop_started) * 1000)
+                                typer.echo(
+                                    f"[stream] flushed-on-quit len={len(merged)} target={resolved_target} "
+                                    f"queue_ms={queue_delay_ms} apply_ms={end_to_end_ms}"
+                                )
                         typer.echo("[local] quit requested")
                         break
 
@@ -284,15 +315,42 @@ def serve(
                     if mic_runtime.error:
                         typer.echo(f"[mic] capture/asr error: {mic_runtime.error}")
                         raise typer.Exit(1)
+                    force_flush = False
+                    got_new_chunk = False
                     for transcript, queued_at in mic_runtime.pop_all():
-                        queue_delay_ms = int((time.time() - queued_at) * 1000)
-                        loop_started = time.time()
-                        controller.on_transcript_chunk(transcript)
-                        end_to_end_ms = int((time.time() - loop_started) * 1000)
-                        typer.echo(
-                            f"[stream] forwarded transcript len={len(transcript)} target={resolved_target} "
-                            f"queue_ms={queue_delay_ms} apply_ms={end_to_end_ms}"
-                        )
+                        cleaned = transcript.strip()
+                        if not cleaned:
+                            continue
+                        if pending_queued_at is None:
+                            pending_queued_at = queued_at
+                        pending_parts.append(cleaned)
+                        last_chunk_arrival_at = time.time()
+                        got_new_chunk = True
+                        if cleaned.endswith((".", "!", "?", "\n")):
+                            force_flush = True
+
+                    should_flush = bool(pending_parts) and (
+                        force_flush
+                        or pending_queued_at is not None
+                        and (time.time() - pending_queued_at) >= flush_interval_s
+                        or not got_new_chunk
+                        and last_chunk_arrival_at is not None
+                        and (time.time() - last_chunk_arrival_at) >= pause_flush_s
+                    )
+                    if should_flush and pending_queued_at is not None:
+                        merged = " ".join(pending_parts).strip()
+                        if merged:
+                            queue_delay_ms = int((time.time() - pending_queued_at) * 1000)
+                            loop_started = time.time()
+                            controller.on_transcript_chunk(merged)
+                            end_to_end_ms = int((time.time() - loop_started) * 1000)
+                            typer.echo(
+                                f"[stream] forwarded transcript len={len(merged)} target={resolved_target} "
+                                f"queue_ms={queue_delay_ms} apply_ms={end_to_end_ms}"
+                            )
+                        pending_parts = []
+                        pending_queued_at = None
+                        last_chunk_arrival_at = None
                 elif not sys.stdin.closed and controller.state == StreamState.STREAMING:
                     if _stdin_has_data():
                         chunk = sys.stdin.readline()
@@ -302,6 +360,21 @@ def serve(
                             typer.echo(
                                 f"[stream] forwarded chunk len={len(clean_chunk)} target={resolved_target}"
                             )
+                else:
+                    if pending_parts and pending_queued_at is not None:
+                        merged = " ".join(pending_parts).strip()
+                        if merged:
+                            queue_delay_ms = int((time.time() - pending_queued_at) * 1000)
+                            loop_started = time.time()
+                            controller.on_transcript_chunk(merged)
+                            end_to_end_ms = int((time.time() - loop_started) * 1000)
+                            typer.echo(
+                                f"[stream] flushed-on-stop len={len(merged)} target={resolved_target} "
+                                f"queue_ms={queue_delay_ms} apply_ms={end_to_end_ms}"
+                            )
+                    pending_parts = []
+                    pending_queued_at = None
+                    last_chunk_arrival_at = None
                 time.sleep(0.05)
     except KeyboardInterrupt:
         pass

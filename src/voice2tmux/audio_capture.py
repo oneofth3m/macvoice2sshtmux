@@ -10,8 +10,8 @@ class AudioCapture:
     """
     Audio source abstraction.
 
-    This MVP scaffold leaves mic capture pluggable so the stream controller,
-    parser, and tmux writer can be built and tested independently.
+    Mic capture is kept pluggable so stream/controller logic can be tested
+    independently from device-specific audio behavior.
     """
 
     def stream_chunks(self) -> Iterable[bytes]:

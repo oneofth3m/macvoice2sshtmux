@@ -88,6 +88,24 @@ def test_local_key_mapping_quit(patched_main) -> None:
     assert should_quit is True
 
 
+def test_serve_prints_reuse_command_when_target_selected_interactively(
+    runner, patched_main, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        patched_main.time, "sleep", lambda _: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+
+    result = runner.invoke(
+        patched_main.app,
+        ["serve", "--ssh-host", "devbox", "--input-source", "stdin", "--no-local-keys"],
+        input="1\n1\n1\n",
+    )
+
+    assert result.exit_code == 0
+    assert "REUSE TARGET (copy/paste):" in result.stdout
+    assert "$ make serve SSH_HOST=devbox TMUX_TARGET=%1" in result.stdout
+
+
 def test_serve_uses_expected_default_asr_tuning(runner, patched_main, monkeypatch) -> None:
     captured = {}
 
@@ -138,7 +156,7 @@ def test_serve_uses_expected_default_asr_tuning(runner, patched_main, monkeypatc
     assert result.exit_code == 0
     assert captured["capture_args"] == {"sample_rate": 16000, "chunk_ms": 80}
     assert captured["asr_args"] == {
-        "model_size": "base.en",
+        "model_size": "small.en",
         "sample_rate": 16000,
         "window_s": 0.9,
         "beam_size": 4,

@@ -32,9 +32,9 @@ run:
 serve:
 	@test -n "$(SSH_HOST)" || (echo "Usage: make serve SSH_HOST=<your_ssh_alias> [TMUX_TARGET=<%pane_or_session:window.pane>]" && exit 1)
 	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && if [ -n "$(TMUX_TARGET)" ]; then \
-		voice2tmux serve --ssh-host $(SSH_HOST) --tmux-target $(TMUX_TARGET); \
+		voice2tmux serve --ssh-host $(SSH_HOST) --tmux-target $(TMUX_TARGET) $(if $(ASR_MODEL),--asr-model $(ASR_MODEL),) $(if $(ASR_WINDOW_S),--asr-window-s $(ASR_WINDOW_S),) $(if $(ASR_BEAM_SIZE),--asr-beam-size $(ASR_BEAM_SIZE),) $(if $(ASR_BEST_OF),--asr-best-of $(ASR_BEST_OF),) $(if $(MIC_CHUNK_MS),--mic-chunk-ms $(MIC_CHUNK_MS),) $(if $(filter false FALSE 0 no NO,$(LOCAL_KEYS)),--no-local-keys,); \
 	else \
-		voice2tmux serve --ssh-host $(SSH_HOST); \
+		voice2tmux serve --ssh-host $(SSH_HOST) $(if $(ASR_MODEL),--asr-model $(ASR_MODEL),) $(if $(ASR_WINDOW_S),--asr-window-s $(ASR_WINDOW_S),) $(if $(ASR_BEAM_SIZE),--asr-beam-size $(ASR_BEAM_SIZE),) $(if $(ASR_BEST_OF),--asr-best-of $(ASR_BEST_OF),) $(if $(MIC_CHUNK_MS),--mic-chunk-ms $(MIC_CHUNK_MS),) $(if $(filter false FALSE 0 no NO,$(LOCAL_KEYS)),--no-local-keys,); \
 	fi
 
 event:

@@ -9,6 +9,7 @@ src/voice2tmux/ipc_server.py
 src/voice2tmux/main.py
 src/voice2tmux/ssh_mux.py
 src/voice2tmux/stream_controller.py
+src/voice2tmux/text_normalizer.py
 src/voice2tmux/tmux_target.py
 src/voice2tmux/tmux_writer.py
 src/voice2tmux/transcript_buffer.py
@@ -18,8 +19,10 @@ src/voice2tmux.egg-info/dependency_links.txt
 src/voice2tmux.egg-info/entry_points.txt
 src/voice2tmux.egg-info/requires.txt
 src/voice2tmux.egg-info/top_level.txt
+tests/test_asr_engine.py
 tests/test_cli_e2e_run.py
 tests/test_cli_e2e_serve_event.py
 tests/test_command_parser.py
 tests/test_ipc_server.py
+tests/test_text_normalizer.py
 tests/test_transcript_buffer.py
