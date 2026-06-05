@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import socket
 import socketserver
 import threading
 from dataclasses import dataclass
@@ -34,6 +35,12 @@ class IPCServer:
         if directory:
             os.makedirs(directory, exist_ok=True)
         if os.path.exists(self.socket_path):
+            # Guard against multiple server instances: if a live process is
+            # already bound to this socket, fail fast instead of taking over.
+            if self._is_socket_live():
+                raise RuntimeError(
+                    f"voice2tmux server is already running on socket {self.socket_path}"
+                )
             os.unlink(self.socket_path)
         self._server = _UnixEventServer(self.socket_path, _EventHandler)
         self._server.event_queue = self._queue
@@ -62,6 +69,14 @@ class IPCServer:
             except queue.Empty:
                 break
         return events
+
+    def _is_socket_live(self) -> bool:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(self.socket_path)
+            return True
+        except OSError:
+            return False
 
 
 class _UnixEventServer(socketserver.ThreadingUnixStreamServer):

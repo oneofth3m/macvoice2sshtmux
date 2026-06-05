@@ -22,6 +22,10 @@ class TranscriptBuffer:
         self.local_draft = draft
 
     def append_text(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if self._should_insert_separator(chunk):
+            self.local_draft += " "
         self.local_draft += chunk
 
     def apply_scratch_that(self) -> None:
@@ -53,4 +57,16 @@ class TranscriptBuffer:
 
     def mark_remote_synced(self) -> None:
         self.remote_emitted = self.local_draft
+
+    def _should_insert_separator(self, chunk: str) -> bool:
+        if not self.local_draft:
+            return False
+        if self.local_draft[-1].isspace():
+            return False
+        if chunk[0].isspace():
+            return False
+        # Do not add a space before punctuation-only continuation chunks.
+        if chunk[0] in ".,!?;:)":
+            return False
+        return True
 

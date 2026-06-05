@@ -58,9 +58,20 @@ This must work without password prompts during normal use.
 make run SSH_HOST=<your_ssh_alias>
 ```
 
+At startup, run mode can guide you interactively:
+- list tmux sessions -> select one
+- list windows in that session -> select one
+- list panes in that window -> select one
+
+Or provide a deterministic target explicitly:
+
+```bash
+make run SSH_HOST=<your_ssh_alias> TMUX_TARGET=<%pane_id_or_session:window.pane>
+```
+
 6) **Try a quick simulation**
 
-- Type normal text and press Enter -> it is streamed to the locked remote tmux pane.
+- Type normal text and press Enter -> it is streamed to the exact `TMUX_TARGET` pane.
 - Type `new line` -> inserts newline.
 - Type `scratch that` -> removes last phrase from local draft and reconciles tail.
 - Press `Ctrl-D` to stop.
@@ -75,6 +86,17 @@ Run long-lived service:
 make serve SSH_HOST=<your_ssh_alias>
 ```
 
+Service mode now uses microphone input by default (true voice flow).
+
+At startup, service mode guides you interactively:
+- list tmux sessions -> select one
+- list windows in that session -> select one
+- list panes in that window -> select one
+
+The selected pane is locked for the whole server run. To change target, stop and restart the server.
+
+Only one server instance is supported; starting another instance on the same socket will fail with a clear message.
+
 From another terminal, trigger control events:
 
 ```bash
@@ -83,6 +105,15 @@ voice2tmux event --event start
 voice2tmux event --event stop
 voice2tmux event --event confirm
 voice2tmux event --event cancel
+```
+
+Notes:
+- `start` begins mic capture + ASR streaming to the locked tmux target
+- `stop` pauses streaming
+- `serve` can still run in stdin debug mode:
+
+```bash
+voice2tmux serve --ssh-host <your_ssh_alias> --input-source stdin
 ```
 
 ## Shortcut commands
@@ -104,11 +135,21 @@ pytest -q
 ruff check src tests
 ```
 
+Test layers now include:
+- unit tests for parser/buffer/ipc primitives
+- hermetic CLI end-to-end tests for:
+  - `run` flow (explicit target + interactive selector)
+  - `serve` and `event` flow (IPC control lifecycle)
+
+E2E modules:
+- `tests/test_cli_e2e_run.py`
+- `tests/test_cli_e2e_serve_event.py`
+
 ## Project structure
 
 - `src/voice2tmux/command_parser.py`: direct command parsing
 - `src/voice2tmux/transcript_buffer.py`: rewrite-tail diff model
-- `src/voice2tmux/tmux_target.py`: active pane resolution
+- `src/voice2tmux/tmux_target.py`: deterministic target resolution (`%pane` or `session:window.pane`)
 - `src/voice2tmux/tmux_writer.py`: tail patch application in tmux
 - `src/voice2tmux/stream_controller.py`: retry and stream state handling
 - `config.example.yaml`: tunable runtime defaults

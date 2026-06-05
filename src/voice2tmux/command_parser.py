@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -25,13 +26,21 @@ class CommandParser:
         normalized = utterance.strip().lower()
         if not normalized:
             return ParseResult(command=CommandType.NONE, text="")
-        if normalized == "new line":
+        phrase = self._normalize_for_command(normalized)
+        if phrase in {"new line", "new line please"}:
             return ParseResult(command=CommandType.NEW_LINE, text="\n")
-        if normalized == "new paragraph":
+        if phrase in {"new paragraph", "new paragraph please"}:
             return ParseResult(command=CommandType.NEW_PARAGRAPH, text="\n\n")
-        if normalized == "scratch that":
+        if phrase in {"scratch that", "scratch that please"}:
             return ParseResult(command=CommandType.SCRATCH_THAT, text="")
-        if normalized == "cancel":
+        if phrase in {"cancel", "cancel please"}:
             return ParseResult(command=CommandType.CANCEL, text="")
         return ParseResult(command=CommandType.NONE, text=utterance)
+
+    def _normalize_for_command(self, utterance: str) -> str:
+        lowered = utterance.lower().strip()
+        # Drop punctuation artifacts from ASR around command phrases.
+        lowered = re.sub(r"[^\w\s]", "", lowered)
+        lowered = re.sub(r"\s+", " ", lowered)
+        return lowered.strip()
 

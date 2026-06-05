@@ -7,7 +7,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class SSHConfig:
     host_alias: str
-    control_path: str = "~/.ssh/cm-%r@%h:%p"
+    # Keep socket path short; %C is OpenSSH hash for connection tuple.
+    control_path: str = "/tmp/voice2tmux-%C"
     control_persist: str = "60s"
 
 

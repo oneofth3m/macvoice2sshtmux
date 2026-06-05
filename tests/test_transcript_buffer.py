@@ -21,3 +21,19 @@ def test_scratch_that_removes_last_word() -> None:
     buf.apply_scratch_that()
     assert buf.local_draft == "write a helper"
 
+
+def test_append_text_inserts_space_between_words_across_chunks() -> None:
+    buf = TranscriptBuffer()
+    buf.append_text("Hello")
+    buf.append_text("What")
+    buf.append_text("you're")
+    buf.append_text("doing?")
+    assert buf.local_draft == "Hello What you're doing?"
+
+
+def test_append_text_does_not_insert_space_before_punctuation() -> None:
+    buf = TranscriptBuffer()
+    buf.append_text("Hello")
+    buf.append_text(".")
+    assert buf.local_draft == "Hello."
+

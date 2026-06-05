@@ -1,25 +1,129 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
+import os
+import termios
+import tty
+from enum import Enum
+from queue import Empty, Queue
+from typing import Callable, Optional, Tuple, TypeVar
 
 import typer
 
 from .ipc_client import send_event
 from .ipc_server import ControlEvent, IPCServer
+from .audio_capture import AudioCapture, MicrophoneCapture
+from .asr_engine import ASREngine, FasterWhisperASR
 from .command_parser import CommandParser
 from .ssh_mux import SSHConfig, SSHMux
 from .stream_controller import StreamController, StreamState
+from .text_normalizer import TextNormalizer
 from .tmux_target import TmuxTargetResolver
 from .tmux_writer import TmuxWriter
 from .transcript_buffer import TranscriptBuffer
 
 app = typer.Typer(no_args_is_help=True)
+T = TypeVar("T")
+
+
+class InputSource(str, Enum):
+    STDIN = "stdin"
+    MIC = "mic"
+
+
+class _MicTranscriptRuntime:
+    def __init__(self, capture: AudioCapture, asr: ASREngine) -> None:
+        self.capture = capture
+        self.asr = asr
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._queue: Queue[tuple[str, float]] = Queue()
+        self._error: Optional[Exception] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def pop_all(self) -> list[tuple[str, float]]:
+        items: list[tuple[str, float]] = []
+        while True:
+            try:
+                items.append(self._queue.get_nowait())
+            except Empty:
+                break
+        return items
+
+    @property
+    def error(self) -> Optional[Exception]:
+        return self._error
+
+    def _run(self) -> None:
+        try:
+            for transcript in self.asr.stream_transcript(self.capture.stream_chunks()):
+                if self._stop_event.is_set():
+                    return
+                if transcript:
+                    self._queue.put((transcript, time.time()))
+        except Exception as exc:  # pragma: no cover - runtime IO path
+            self._error = exc
+
+
+class _SingleKeyReader:
+    """Non-blocking single-character reader for local serve controls."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._fd: Optional[int] = None
+        self._old_attrs = None
+
+    def __enter__(self) -> "_SingleKeyReader":
+        if not self.enabled:
+            return self
+        if not sys.stdin.isatty():
+            self.enabled = False
+            return self
+        self._fd = sys.stdin.fileno()
+        self._old_attrs = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.enabled and self._fd is not None and self._old_attrs is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
+
+    def poll_key(self) -> Optional[str]:
+        if not self.enabled or self._fd is None:
+            return None
+        if not _stdin_has_data():
+            return None
+        try:
+            data = os.read(self._fd, 1)
+        except OSError:
+            return None
+        if not data:
+            return None
+        return data.decode("utf-8", errors="ignore").lower()
 
 
 @app.command()
 def run(
     ssh_host: str = typer.Option(..., help="SSH host alias from ~/.ssh/config"),
+    tmux_target: Optional[str] = typer.Option(
+        None,
+        help="Optional deterministic tmux target, e.g. %12 or session:window.pane. If omitted, interactive selector starts.",
+    ),
     once: bool = typer.Option(False, help="Process one line and exit."),
 ) -> None:
     """
@@ -30,12 +134,15 @@ def run(
     """
     ssh = SSHMux(SSHConfig(host_alias=ssh_host))
     ssh.ensure_master()
+    resolver = TmuxTargetResolver(ssh)
     controller = StreamController(
         parser=CommandParser(),
         buffer=TranscriptBuffer(),
-        target_resolver=TmuxTargetResolver(ssh),
+        normalizer=TextNormalizer(),
+        target_resolver=resolver,
         writer=TmuxWriter(ssh),
     )
+    controller.target_spec = tmux_target or _interactive_select_tmux_target(resolver)
     controller.start_capture()
     typer.echo("voice2tmux started. Type transcript chunks; Ctrl-D to end.")
     try:
@@ -53,8 +160,42 @@ def run(
 @app.command()
 def serve(
     ssh_host: str = typer.Option(..., help="SSH host alias from ~/.ssh/config"),
+    tmux_target: Optional[str] = typer.Option(
+        None,
+        help="Optional deterministic tmux target, e.g. %12 or session:window.pane. If omitted, interactive selector starts.",
+    ),
     socket_path: str = typer.Option(
         "/tmp/macvoice2sshtmux.sock", help="UNIX socket path for local control events."
+    ),
+    input_source: InputSource = typer.Option(
+        InputSource.MIC,
+        "--input-source",
+        help="Transcript source: mic for real voice capture, stdin for manual piping/debug.",
+    ),
+    local_keys: bool = typer.Option(
+        True,
+        "--local-keys/--no-local-keys",
+        help="Enable local single-key controls: s=start/stop c=confirm x=cancel q=quit h=help.",
+    ),
+    mic_chunk_ms: int = typer.Option(
+        80,
+        help="Microphone chunk size in milliseconds. Lower values reduce latency.",
+    ),
+    asr_window_s: float = typer.Option(
+        0.9,
+        help="ASR window size in seconds. Lower values reduce latency.",
+    ),
+    asr_model: str = typer.Option(
+        "base.en",
+        help="faster-whisper model size (e.g., tiny.en, base.en, small.en).",
+    ),
+    asr_beam_size: int = typer.Option(
+        4,
+        help="Whisper beam size. Lower is faster, higher can improve accuracy.",
+    ),
+    asr_best_of: int = typer.Option(
+        4,
+        help="Whisper best-of candidates. Lower is faster.",
     ),
 ) -> None:
     """
@@ -66,29 +207,107 @@ def serve(
     """
     ssh = SSHMux(SSHConfig(host_alias=ssh_host))
     ssh.ensure_master()
+    resolver = TmuxTargetResolver(ssh)
     controller = StreamController(
         parser=CommandParser(),
         buffer=TranscriptBuffer(),
-        target_resolver=TmuxTargetResolver(ssh),
+        normalizer=TextNormalizer(),
+        target_resolver=resolver,
         writer=TmuxWriter(ssh),
     )
+    resolved_target = tmux_target or _interactive_select_tmux_target(resolver)
+    controller.target_spec = resolved_target
     ipc = IPCServer(socket_path=socket_path)
-    ipc.start()
+    try:
+        ipc.start()
+    except RuntimeError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1)
+    mic_runtime: Optional[_MicTranscriptRuntime] = None
+    if input_source == InputSource.MIC:
+        mic_runtime = _MicTranscriptRuntime(
+            capture=MicrophoneCapture(sample_rate=16000, chunk_ms=mic_chunk_ms),
+            asr=FasterWhisperASR(
+                model_size=asr_model,
+                sample_rate=16000,
+                window_s=asr_window_s,
+                beam_size=asr_beam_size,
+                best_of=asr_best_of,
+                condition_on_previous_text=False,
+            ),
+        )
+    if input_source == InputSource.STDIN and local_keys:
+        typer.echo("local keys disabled for --input-source stdin (stdin reserved for transcript input).")
+        local_keys = False
+
     typer.echo(f"voice2tmux service listening on {socket_path}")
     typer.echo("Send control events with: voice2tmux event --event start|stop|confirm|cancel")
+    typer.echo(f"Target locked for this run: {resolved_target}")
+    typer.echo("Service starts in idle state. Send 'start' event to begin streaming.")
+    typer.echo(f"Input source: {input_source.value}")
+    if input_source == InputSource.MIC:
+        typer.echo("When streaming, microphone audio is transcribed and forwarded to remote tmux.")
+        typer.echo(
+            "ASR config: "
+            f"model={asr_model} mic_chunk_ms={mic_chunk_ms} asr_window_s={asr_window_s} "
+            f"beam={asr_beam_size} best_of={asr_best_of} context=false"
+        )
+    else:
+        typer.echo("When streaming, stdin transcript lines are forwarded to remote tmux.")
+    if local_keys:
+        typer.echo("Local keys: s=start/stop  c=confirm  x=cancel  q=quit  h=help")
     try:
-        while True:
-            for message in ipc.pop_all():
-                _handle_control(controller, message.event)
-            if not sys.stdin.closed and controller.state == StreamState.STREAMING:
-                if _stdin_has_data():
-                    chunk = sys.stdin.readline()
-                    if chunk:
-                        controller.on_transcript_chunk(chunk.strip())
-            time.sleep(0.05)
+        with _SingleKeyReader(enabled=local_keys) as key_reader:
+            while True:
+                key = key_reader.poll_key()
+                if key:
+                    should_quit = _handle_local_key(controller, key)
+                    if mic_runtime and controller.state == StreamState.STREAMING:
+                        mic_runtime.start()
+                    if mic_runtime and controller.state in {StreamState.IDLE, StreamState.STOPPED}:
+                        mic_runtime.stop()
+                    if should_quit:
+                        typer.echo("[local] quit requested")
+                        break
+
+                for message in ipc.pop_all():
+                    before_state = controller.state
+                    _handle_control(controller, message.event)
+                    if mic_runtime and message.event == ControlEvent.START and controller.state == StreamState.STREAMING:
+                        mic_runtime.start()
+                    if mic_runtime and message.event in {ControlEvent.STOP, ControlEvent.CANCEL}:
+                        mic_runtime.stop()
+                    typer.echo(
+                        f"[control] event={message.event.value} state={before_state.value}->{controller.state.value}"
+                    )
+                if mic_runtime and controller.state == StreamState.STREAMING:
+                    if mic_runtime.error:
+                        typer.echo(f"[mic] capture/asr error: {mic_runtime.error}")
+                        raise typer.Exit(1)
+                    for transcript, queued_at in mic_runtime.pop_all():
+                        queue_delay_ms = int((time.time() - queued_at) * 1000)
+                        loop_started = time.time()
+                        controller.on_transcript_chunk(transcript)
+                        end_to_end_ms = int((time.time() - loop_started) * 1000)
+                        typer.echo(
+                            f"[stream] forwarded transcript len={len(transcript)} target={resolved_target} "
+                            f"queue_ms={queue_delay_ms} apply_ms={end_to_end_ms}"
+                        )
+                elif not sys.stdin.closed and controller.state == StreamState.STREAMING:
+                    if _stdin_has_data():
+                        chunk = sys.stdin.readline()
+                        if chunk:
+                            clean_chunk = chunk.strip()
+                            controller.on_transcript_chunk(clean_chunk)
+                            typer.echo(
+                                f"[stream] forwarded chunk len={len(clean_chunk)} target={resolved_target}"
+                            )
+                time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
+        if mic_runtime:
+            mic_runtime.stop()
         ipc.stop()
         controller.stop_capture()
         typer.echo("voice2tmux service stopped.")
@@ -103,6 +322,7 @@ def event(
 ) -> None:
     """Sends a control event to a running voice2tmux service."""
     send_event(socket_path=socket_path, event=event)
+    typer.echo(f"sent event '{event}' to {socket_path}")
 
 
 def _handle_control(controller: StreamController, event: ControlEvent) -> None:
@@ -125,6 +345,70 @@ def _stdin_has_data() -> bool:
 
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     return bool(ready)
+
+
+def _handle_local_key(controller: StreamController, key: str) -> bool:
+    if key == "h":
+        typer.echo("[local] keys: s=start/stop c=confirm x=cancel q=quit h=help")
+        return False
+    event, should_quit = _map_local_key(key, controller.state)
+    if event is not None:
+        before = controller.state
+        _handle_control(controller, event)
+        typer.echo(f"[local] key={key} event={event.value} state={before.value}->{controller.state.value}")
+    return should_quit
+
+
+def _map_local_key(key: str, state: StreamState) -> Tuple[Optional[ControlEvent], bool]:
+    if key == "q":
+        return None, True
+    if key == "s":
+        if state in {StreamState.IDLE, StreamState.STOPPED}:
+            return ControlEvent.START, False
+        return ControlEvent.STOP, False
+    if key == "c":
+        return ControlEvent.CONFIRM, False
+    if key == "x":
+        return ControlEvent.CANCEL, False
+    return None, False
+
+
+def _interactive_select_tmux_target(resolver: TmuxTargetResolver) -> str:
+    typer.echo("No --tmux-target provided. Starting interactive tmux selector.")
+    sessions = resolver.list_sessions()
+    if not sessions:
+        typer.echo("No tmux sessions found on remote host.")
+        raise typer.Exit(1)
+    session = _choose("Select tmux session", sessions, lambda s: s.name)
+
+    windows = resolver.list_windows(session.name)
+    if not windows:
+        typer.echo(f"No tmux windows found in session '{session.name}'.")
+        raise typer.Exit(1)
+    window = _choose("Select tmux window", windows, lambda w: f"{w.index}: {w.name}")
+
+    target_window = f"{session.name}:{window.index}"
+    panes = resolver.list_panes(target_window)
+    if not panes:
+        typer.echo(f"No panes found in window '{target_window}'.")
+        raise typer.Exit(1)
+    pane = _choose(
+        "Select tmux pane",
+        panes,
+        lambda p: f"{p.pane_id} (index={p.index}, cmd={p.current_command}, active={p.is_active})",
+    )
+    return pane.pane_id
+
+
+def _choose(title: str, items: list[T], formatter: Callable[[T], str]) -> T:
+    typer.echo(f"\n{title}:")
+    for idx, item in enumerate(items, start=1):
+        typer.echo(f"  {idx}. {formatter(item)}")
+    while True:
+        value = typer.prompt("Enter number", type=int)
+        if 1 <= value <= len(items):
+            return items[value - 1]
+        typer.echo(f"Please enter a number between 1 and {len(items)}.")
 
 
 if __name__ == "__main__":

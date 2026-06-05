@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .command_parser import CommandParser, CommandType
+from .text_normalizer import TextNormalizer
 from .tmux_target import TmuxTarget, TmuxTargetResolver
 from .tmux_writer import TmuxWriter
 from .transcript_buffer import TranscriptBuffer
@@ -29,27 +30,31 @@ class StreamController:
         self,
         parser: CommandParser,
         buffer: TranscriptBuffer,
+        normalizer: TextNormalizer,
         target_resolver: TmuxTargetResolver,
         writer: TmuxWriter,
         config: StreamConfig | None = None,
     ) -> None:
         self.parser = parser
         self.buffer = buffer
+        self.normalizer = normalizer
         self.target_resolver = target_resolver
         self.writer = writer
         self.config = config or StreamConfig()
         self.state = StreamState.IDLE
         self.locked_target: TmuxTarget | None = None
         self._last_failed_patch = None
+        self.target_spec = "active"
 
     def start_capture(self) -> None:
-        self.locked_target = self.target_resolver.current_active_target()
+        self.locked_target = self.target_resolver.resolve_target(self.target_spec)
         self.state = StreamState.STREAMING
 
     def stop_capture(self) -> None:
         self.state = StreamState.IDLE
         self.locked_target = None
         self.buffer.reset()
+        self.normalizer.reset()
         self._last_failed_patch = None
 
     def restart_capture(self) -> None:
@@ -83,7 +88,13 @@ class StreamController:
         if parsed.command == CommandType.SCRATCH_THAT:
             self.buffer.apply_scratch_that()
         else:
-            self.buffer.append_text(parsed.text)
+            if parsed.command == CommandType.NONE:
+                normalized_text = self.normalizer.normalize_chunk(parsed.text)
+                if not normalized_text:
+                    return
+                self.buffer.append_text(normalized_text)
+            else:
+                self.buffer.append_text(parsed.text)
         self._flush_with_retry()
 
     def _flush_with_retry(self) -> None:

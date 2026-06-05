@@ -22,12 +22,20 @@ setup:
 	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && pip install -e ".[dev,asr]"
 
 run:
-	@test -n "$(SSH_HOST)" || (echo "Usage: make run SSH_HOST=<your_ssh_alias>" && exit 1)
-	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && voice2tmux run --ssh-host $(SSH_HOST)
+	@test -n "$(SSH_HOST)" || (echo "Usage: make run SSH_HOST=<your_ssh_alias> [TMUX_TARGET=<%pane_or_session:window.pane>]" && exit 1)
+	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && if [ -n "$(TMUX_TARGET)" ]; then \
+		voice2tmux run --ssh-host $(SSH_HOST) --tmux-target $(TMUX_TARGET); \
+	else \
+		voice2tmux run --ssh-host $(SSH_HOST); \
+	fi
 
 serve:
-	@test -n "$(SSH_HOST)" || (echo "Usage: make serve SSH_HOST=<your_ssh_alias>" && exit 1)
-	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && voice2tmux serve --ssh-host $(SSH_HOST)
+	@test -n "$(SSH_HOST)" || (echo "Usage: make serve SSH_HOST=<your_ssh_alias> [TMUX_TARGET=<%pane_or_session:window.pane>]" && exit 1)
+	@cd "$(PROJECT_DIR)" && $(ACTIVATE) && if [ -n "$(TMUX_TARGET)" ]; then \
+		voice2tmux serve --ssh-host $(SSH_HOST) --tmux-target $(TMUX_TARGET); \
+	else \
+		voice2tmux serve --ssh-host $(SSH_HOST); \
+	fi
 
 event:
 	@test -n "$(EVENT)" || (echo "Usage: make event EVENT=start|stop|confirm|cancel" && exit 1)
